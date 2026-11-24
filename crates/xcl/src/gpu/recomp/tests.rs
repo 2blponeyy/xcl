@@ -7589,3 +7589,47 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// Jumps that cross each other – each to a target past the next one's – are pending at once:
+/// a guard of the code between them stays one comparison (it tested the flag of every pending
+/// jump, quadratic: 100 of the 155 MB of HLSL of a retail CS), and each jump still skips
+/// exactly the code up to its target.
+#[test]
+fn crossing_jumps_keep_guards_small() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    const N: u64 = 32;
+    // jump k (taken if bit k of s5 is set) lands on the k-th block after the last jump; the
+    // blocks after the jumps set bits of s4, the blocks at the targets bits of s3
+    let mut code: Vec<u8> = Vec::new();
+    let mut jumps = Vec::new();
+    for k in 0..N {
+        code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 5), ("SSRC1", 128 + k)]));
+        jumps.push(code.len());
+        code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        code.extend(i("S_BITSET1_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128 + k)]));
+    }
+    for (k, at) in jumps.into_iter().enumerate() {
+        let d = ((code.len() - at) / 4 - 1) as u16;
+        code[at..at + 2].copy_from_slice(&d.to_le_bytes());
+        code.extend(i("S_BITSET1_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 128 + k as u64)]));
+    }
+    code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete() && !t.hlsl.contains("if (pc =="), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    let uses = t.hlsl.matches("xcl_skip").count();
+    assert!(uses < 6 * N as usize, "{uses} uses of xcl_skip for {N} jumps:\n{}", t.hlsl);
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for &wave64 in &gpu_waves() {
+        let t = translate(&code, &Options { wave64, ..Default::default() }).unwrap();
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        for mask in [0u32, 1, 0x20, 0x8000_0000, 0xA5A5_0000, u32::MAX] {
+            let mut st = KernelState::default();
+            st.sgpr[5] = mask;
+            let r = runner::run(&dxil, &st, &mem).unwrap();
+            // the first jump taken: the blocks before it and the targets from its own on ran
+            let first = mask.trailing_zeros();
+            let (before, after) = if first == 32 { (u32::MAX, u32::MAX) } else { ((1u32 << first) - 1, !((1u32 << first) - 1)) };
+            assert_eq!((r.sgpr[4], r.sgpr[3]), (before, after), "s5 = {mask:#x}, wave64 {wave64}");
+        }
+    }
+}
